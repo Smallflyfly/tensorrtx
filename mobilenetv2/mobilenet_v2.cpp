@@ -9,6 +9,11 @@
 #include <chrono>
 #include <cmath>
 
+#include "opencv2/core.hpp"
+#include "opencv2/imgproc.hpp"
+#include "opencv2/highgui.hpp"
+#include "opencv2/videoio.hpp"
+
 #define CHECK(status) \
     do\
     {\
@@ -21,9 +26,9 @@
     } while (0)
 
 // stuff we know about the network and the input/output blobs
-static const int INPUT_H = 224;
-static const int INPUT_W = 224;
-static const int OUTPUT_SIZE = 1000;
+static const int INPUT_H = 480;
+static const int INPUT_W = 640;
+static const int OUTPUT_SIZE = 10;
 
 const char* INPUT_BLOB_NAME = "data";
 const char* OUTPUT_BLOB_NAME = "prob";
@@ -170,6 +175,32 @@ ILayer* invertedRes(INetworkDefinition *network, std::map<std::string, Weights>&
     return ew3;
 }
 
+ILayer *softMaxImpl(INetworkDefinition *network, ITensor &input, int c) {
+    IShuffleLayer *shuffleLayer1 = network->addShuffle(input);
+    assert(shuffleLayer1);
+    shuffleLayer1->setReshapeDimensions(Dims3(1, -1, c));
+
+    Dims dim0 = shuffleLayer1->getOutput(0)->getDimensions();
+
+    std::cout << "softmax dims " << dim0.d[0] << " " << dim0.d[1] << " " << dim0.d[2] << " " << dim0.d[3] << std::endl;
+
+    ISoftMaxLayer *softMaxLayer = network->addSoftMax(*shuffleLayer1->getOutput(0));
+    assert(softMaxLayer);
+    softMaxLayer->setAxes(1 << 2);
+
+    // 1-dim
+    Dims dim_;
+    dim_.nbDims = 1;
+    dim_.d[0] = -1;
+
+    IShuffleLayer *shuffleLayer2 = network->addShuffle(*softMaxLayer->getOutput(0));
+    assert(shuffleLayer2);
+    shuffleLayer2->setReshapeDimensions(dim_);
+
+    return shuffleLayer2;
+
+}
+
 // Creat the engine using only the API and not any parser.
 ICudaEngine* createEngine(unsigned int maxBatchSize, IBuilder* builder, IBuilderConfig* config, DataType dt)
 {
@@ -179,7 +210,7 @@ ICudaEngine* createEngine(unsigned int maxBatchSize, IBuilder* builder, IBuilder
     ITensor* data = network->addInput(INPUT_BLOB_NAME, dt, Dims3{3, INPUT_H, INPUT_W});
     assert(data);
 
-    std::map<std::string, Weights> weightMap = loadWeights("../mobilenet.wts");
+    std::map<std::string, Weights> weightMap = loadWeights("./mobilenet.wts");
     Weights emptywts{DataType::kFLOAT, nullptr, 0};
 
     auto ew1 = convBnRelu(network, weightMap, *data, 32, 3, 2, 1, "features.0.");
@@ -202,15 +233,22 @@ ICudaEngine* createEngine(unsigned int maxBatchSize, IBuilder* builder, IBuilder
     ir1 = invertedRes(network, weightMap, *ir1->getOutput(0), "features.17.", 160, 320, 1, 6);
     IElementWiseLayer* ew2 = convBnRelu(network, weightMap, *ir1->getOutput(0), 1280, 1, 1, 1, "features.18.");
 
-    IPoolingLayer* pool1 = network->addPoolingNd(*ew2->getOutput(0), PoolingType::kAVERAGE, DimsHW{7, 7});
+    IPoolingLayer* pool1 = network->addPoolingNd(*ew2->getOutput(0), PoolingType::kAVERAGE, DimsHW{15, 20});
     assert(pool1);
+//    pool1->setStrideNd(DimsHW{})
 
-    IFullyConnectedLayer* fc1 = network->addFullyConnected(*pool1->getOutput(0), 1000, weightMap["classifier.1.weight"], weightMap["classifier.1.bias"]);
+    IFullyConnectedLayer* fc1 = network->addFullyConnected(*pool1->getOutput(0), 10, weightMap["classifier.1.weight"], weightMap["classifier.1.bias"]);
     assert(fc1);
 
-    fc1->getOutput(0)->setName(OUTPUT_BLOB_NAME);
-    std::cout << "set name out" << std::endl;
-    network->markOutput(*fc1->getOutput(0));
+//    fc1->getOutput(0)->setName(OUTPUT_BLOB_NAME);
+//    std::cout << "set name out" << std::endl;
+//    network->markOutput(*fc1->getOutput(0));
+
+    // add softmax layer
+    ILayer *softmaxLayer = softMaxImpl(network, *fc1->getOutput(0), OUTPUT_SIZE);
+    // set output name
+    softmaxLayer->getOutput(0)->setName(OUTPUT_BLOB_NAME);
+    network->markOutput(*softmaxLayer->getOutput(0));
 
     // Build engine
     builder->setMaxBatchSize(maxBatchSize);
@@ -285,12 +323,12 @@ void doInference(IExecutionContext& context, float* input, float* output, int ba
 
 int main(int argc, char** argv)
 {
-    if (argc != 2) {
-        std::cerr << "arguments not right!" << std::endl;
-        std::cerr << "./mobilenet -s   // serialize model to plan file" << std::endl;
-        std::cerr << "./mobilenet -d   // deserialize plan file and run inference" << std::endl;
-        return -1;
-    }
+//    if (argc != 2) {
+//        std::cerr << "arguments not right!" << std::endl;
+//        std::cerr << "./mobilenet -s   // serialize model to plan file" << std::endl;
+//        std::cerr << "./mobilenet -d   // deserialize plan file and run inference" << std::endl;
+//        return -1;
+//    }
 
     // create a model using the API directly and serialize it to a stream
     char *trtModelStream{nullptr};
@@ -331,6 +369,21 @@ int main(int argc, char** argv)
     for (int i = 0; i < 3 * INPUT_H * INPUT_W; i++)
         data[i] = 1.0;
 
+    std::string imageName = argv[2];
+    cv::Mat im = cv::imread(imageName);
+    if (im.empty()) {
+        std::cerr << "image file is wrong." << std::endl;
+    }
+
+    float mean[3] = {0.33708435, 0.42723662, 0.41629601};
+    float std[3] = {0.2618102, 0.31948383, 0.33079577};
+    float *pData = &data[0];
+    for (int i = 0; i < INPUT_H * INPUT_W; ++i) {
+        pData[i] = (float)(im.at<cv::Vec3b>(i)[2] / 255.0 - mean[2]) / std[2];
+        pData[i + INPUT_H * INPUT_W] = float(im.at<cv::Vec3b>(i)[1] / 255.0 - mean[1]) / std[1];
+        pData[i + 2 * INPUT_H * INPUT_W] = float(im.at<cv::Vec3b>(i)[0] / 255.0 - mean[0]) / std[0];
+    }
+
     IRuntime* runtime = createInferRuntime(gLogger);
     assert(runtime != nullptr);
     ICudaEngine* engine = runtime->deserializeCudaEngine(trtModelStream, size, nullptr);
@@ -358,7 +411,7 @@ int main(int argc, char** argv)
     for (unsigned int i = 0; i < OUTPUT_SIZE; i++)
     {
         std::cout << prob[i] << ", ";
-        if (i % 10 == 0) std::cout << i / 10 << std::endl;
+//        if (i % 10 == 0) std::cout << i / 10 << std::endl;
     }
     std::cout << std::endl;
 
